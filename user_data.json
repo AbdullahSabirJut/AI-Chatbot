@@ -1,0 +1,14 @@
+[
+    {
+        "name": "John Smith",
+        "email": "john.smith@xyz.com",
+        "phone": "+9233267558",
+        "city": "New York"
+    },
+    {
+        "name": "Abdullah Sabir",
+        "email": "abdullah.sabir@xyz.com",
+        "phone": "+0123456789",
+        "city": "Cordoba"
+    }
+]
