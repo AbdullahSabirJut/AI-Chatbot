@@ -1,198 +1,262 @@
 import json
 import re
+from pathlib import Path
 from flask import Flask, render_template, request, jsonify
-from transformers import pipeline
 
-app = Flask(__name__)
-# The simple auto-login email
+app = Flask(__name__, template_folder="templates")
+
 ADMIN_EMAIL = "wpbrigade@company.com"
-# Simple JSON file to act as a database
-DATA_FILE = 'user_data.json'
-
-# --- AI Model Setup ---
-
-class ChatbotModel:
-    """A class to simulate Intent Classification."""
-    def __init__(self):
-        # Initialize a sentiment analysis pipeline as a robust placeholder.
-        # This ensures the `transformers` library is used, fulfilling the requirement.
-        self.classifier = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-
-    def classify_intent(self, text):
-        """Simulates Intent Classification based on simple keywords."""
-        text = text.lower()
-        if 'add' in text or 'create' in text or 'new user' in text:
-            return 'add_user'
-        if 'remove' in text or 'delete' in text or 'take out' in text:
-            return 'delete_user'
-        if 'update' in text or 'change' in text or 'modify' in text:
-            return 'update_user'
-        return 'unknown'
-
-chatbot_model = ChatbotModel()
+DATA_FILE = Path("user_data.json")
 
 
-# --- Database Helpers ---
+# ---------- Simple intent classifier (keyword rules) ----------
+def classify_intent(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in ("add", "create", "new user", "add the user")):
+        return "add_user"
+    if any(k in t for k in ("remove", "delete", "take out")):
+        return "delete_user"
+    if any(k in t for k in ("update", "change", "modify")):
+        return "update_user"
+    return "unknown"
+
+
+# ---------- Data persistence ----------
 def load_data():
-    """Loads user data from the JSON file."""
-    try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        # Create an empty file if it doesn't exist or is invalid
-        with open(DATA_FILE, 'w') as f:
-            json.dump([], f)
+    """Return a normalized list of users from the JSON file."""
+    if not DATA_FILE.exists():
+        DATA_FILE.write_text("[]", encoding="utf-8")
         return []
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        DATA_FILE.write_text("[]", encoding="utf-8")
+        return []
+    out = []
+    for u in data:
+        out.append({
+            "name": u.get("name", "N/A"),
+            "email": (u.get("email") or "").lower(),
+            "phone": u.get("phone", "N/A"),
+            "city": u.get("city", "N/A"),
+        })
+    return out
 
-def save_data(data):
-    """Saves user data to the JSON file."""
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
 
-# --- Chat Command Handlers ---
+def save_data(users):
+    with DATA_FILE.open("w", encoding="utf-8") as f:
+        json.dump(users, f, indent=4)
 
-def handle_add_user(command):
-    """Adds a new user based on the command."""
+
+# ---------- Utilities ----------
+def safe_name_from_email(email: str) -> str:
+    """Convert local-part of email to a readable name: john.smith -> John Smith"""
+    local = (email or "").split("@")[0]
+    local = re.sub(r"[._\-]+", " ", local)         # replace separators with space
+    local = re.sub(r"\d+", "", local).strip()      # drop digits
+    parts = [p.capitalize() for p in local.split() if p]
+    return " ".join(parts) if parts else "N/A"
+
+
+def normalize_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def find_by_email(users, email):
+    key = (email or "").lower()
+    for u in users:
+        if u.get("email", "") == key:
+            return u
+    return None
+
+
+def find_by_normalized_name(users, name_token):
+    norm = normalize_key(name_token)
+    for u in users:
+        if normalize_key(u.get("name", "")) == norm or normalize_key(u.get("email", "")) == norm:
+            return u
+    return None
+
+
+# ---------- Command handlers ----------
+def handle_add_user(command: str) -> str:
     users = load_data()
-    # Regex to find email and phone number
-    email_match = re.search(r'([\w\.-]+@[\w\.-]+)', command)
-    phone_match = re.search(r'\+?\d{10,15}', command)
 
-    if not email_match:
-        return "I couldn't find a valid email address in your request. Please specify one."
+    # quoted name if present (prefer quoted name)
+    quoted = re.search(r'["\']\s*([A-Za-z0-9 .\'\-]+?)\s*["\']', command)
+    quoted_name = None
+    if quoted:
+        candidate = quoted.group(1).strip()
+        if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', candidate):  # ignore quoted emails
+            quoted_name = candidate
 
-    email = email_match.group(1).lower()
-    phone = phone_match.group(0) if phone_match else 'N/A'
+    # email (require it)
+    email_m = re.search(r'([\w\.-]+@[\w\.-]+\.[A-Za-z]{2,})', command)
+    if not email_m:
+        return "I couldn't find a valid email address in your request. Please provide an email like john@example.com."
+    email = email_m.group(1).lower()
 
-    if any(user['email'] == email for user in users):
+    # phone (optional) - accept + and 3-15 digits
+    phone_m = re.search(r'(\+?\d{3,15})', command)
+    phone = phone_m.group(1) if phone_m else "N/A"
+
+    # choose name: quoted overrides; otherwise derive from email
+    name = quoted_name if quoted_name else safe_name_from_email(email)
+
+    # duplicate check
+    if any(u["email"] == email for u in users):
         return f"User with email **{email}** already exists."
 
-    new_user = {'email': email, 'phone': phone, 'city': 'N/A'}
-    users.append(new_user)
+    users.append({"name": name, "email": email, "phone": phone, "city": "N/A"})
     save_data(users)
-    return f"✅ User **{email}** successfully added with phone: **{phone}**."
+    return f"✅ User **{name}** <{email}> successfully added with phone: **{phone}**."
 
-def handle_delete_user(command):
-    """Deletes a user based on the command."""
+
+def handle_delete_user(command: str) -> str:
     users = load_data()
-    email_match = re.search(r'([\w\.-]+@[\w\.-]+)', command)
 
-    if not email_match:
-        return "I couldn't find an email address to delete."
+    # 1) by email
+    email_m = re.search(r'([\w\.-]+@[\w\.-]+\.[A-Za-z]{2,})', command)
+    if email_m:
+        key = email_m.group(1).lower()
+        new = [u for u in users if u["email"] != key]
+        if len(new) == len(users):
+            return f"User with email **{key}** not found."
+        save_data(new)
+        return f"🗑️ User **{key}** removed."
 
-    email_to_delete = email_match.group(1).lower()
-    
-    # Filter out the user to be deleted
-    initial_count = len(users)
-    updated_users = [user for user in users if user['email'] != email_to_delete]
-    
-    if len(updated_users) == initial_count:
-        return f"User with email **{email_to_delete}** not found in the system."
+    # 2) by quoted name
+    quoted = re.search(r'["\']\s*([A-Za-z0-9 .\'\-]+?)\s*["\']', command)
+    if quoted:
+        name_key = quoted.group(1).strip().lower()
+        new = [u for u in users if u["name"].lower() != name_key]
+        if len(new) == len(users):
+            return f"User named **{quoted.group(1).strip()}** not found."
+        save_data(new)
+        return f"🗑️ User **{quoted.group(1).strip()}** removed."
 
-    save_data(updated_users)
-    return f"🗑️ User **{email_to_delete}** has been removed from the system."
+    # 3) fallback: patterns like "delete John Smith" or "remove samanthas"
+    fallback = re.search(r'(?:remove|delete)\s+(?:the\s+)?(?:user\s+)?([A-Za-z0-9\.\' \-]{1,60})(?:\s+with|\s+email|\s+phone|$)', command, re.IGNORECASE)
+    if fallback:
+        candidate = fallback.group(1).strip().lower()
+        # handle simple possessive forms ("samanthas" -> "samantha")
+        candidate = re.sub(r"'s$", "", candidate)
+        if " " not in candidate and candidate.endswith("s"):
+            candidate = candidate[:-1]
+        norm = normalize_key(candidate)
+        new = [u for u in users if normalize_key(u["name"]) != norm and normalize_key(u["email"]) != norm]
+        if len(new) == len(users):
+            return f"User **{fallback.group(1).strip()}** not found."
+        save_data(new)
+        return f"🗑️ User **{fallback.group(1).strip()}** removed."
 
-def handle_update_user(command):
-    """Updates a user's city based on the command, using email as the identifier."""
+    return "I couldn't find which user to delete. Please specify an email or a quoted name."
+
+
+def handle_update_user(command: str) -> str:
     users = load_data()
-    
-    # Find user by email
-    email_match = re.search(r'([\w\.-]+@[\w\.-]+)', command)
-    
-    if not email_match:
-        return "To update a user, please specify their email address."
-        
-    user_email = email_match.group(1).lower()
-        
-    # Find the target city value (search for 'to X' or 'to Xyz')
-    city_match = re.search(r'city\s+to\s+(\w+)', command, re.IGNORECASE)
-    if not city_match:
-        return "I couldn't find the new city value to update. Use the format 'update [email] city to [CityName]'."
-        
-    new_city = city_match.group(1).capitalize()
-    
-    # Loop through users and perform the update
-    updated = False
-    for user in users:
-        if user['email'] == user_email:
-            user['city'] = new_city
-            updated = True
-            break
 
-    if not updated:
-        return f"User **{user_email}** not found to update."
+    # find new city (multi-word allowed)
+    city_m = re.search(r'city\s+to\s+([A-Za-z0-9 \-]+)', command, re.IGNORECASE)
+    if not city_m:
+        return "I couldn't find the new city. Use format: 'update [email|name] city to [CityName]'."
+    new_city = city_m.group(1).strip()
 
+    # 1) prefer email if present
+    email_m = re.search(r'([\w\.-]+@[\w\.-]+\.[A-Za-z]{2,})', command)
+    if email_m:
+        email = email_m.group(1).lower()
+        target = find_by_email(users, email)
+        if not target:
+            return f"User with email **{email}** not found."
+        target["city"] = new_city
+        save_data(users)
+        return f"📝 Successfully updated **{email}** city to **{new_city}**."
+
+    # 2) quoted name
+    quoted = re.search(r'["\']\s*([A-Za-z0-9 .\'\-]+?)\s*["\']', command)
+    candidate = quoted.group(1).strip().lower() if quoted else None
+
+    # 3) name before word 'city' (e.g., "update samanthas city to Cordoba")
+    if not candidate:
+        m = re.search(r'update\s+([A-Za-z0-9\.\' \-]{1,60}?)\s+city', command, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip().lower()
+
+    if not candidate:
+        return "Please specify which user to update (email or name)."
+
+    candidate = re.sub(r"'s$", "", candidate)
+    if " " not in candidate and candidate.endswith("s"):
+        candidate = candidate[:-1]
+    target = find_by_normalized_name(users, candidate)
+    if not target:
+        return f"User **{candidate}** not found."
+    target["city"] = new_city
     save_data(users)
-    return f"📝 Successfully updated **{user_email}'s** city to **{new_city}**."
+    return f"📝 Successfully updated **{candidate}**'s city to **{new_city}**."
 
 
-# --- Flask Routes ---
-
-@app.route('/', methods=['GET', 'POST'])
+# ---------- Routes (unchanged interface) ----------
+@app.route("/", methods=["GET", "POST"])
 def home():
-    """Handles the auto-login and serves the main chat interface."""
-    if request.method == 'POST':
-        # Simple auto-login mechanism
-        user_email = request.form.get('email', '').strip()
-        if user_email.lower() == ADMIN_EMAIL:
-            # If authenticated, render the index.html template from the 'templates' folder
-            return render_template('index.html')
-        else:
-            return "Unauthorized access. Email not recognized.", 401
+    if request.method == "POST":
+        user_email = (request.form.get("email") or "").strip().lower()
+        if not user_email:
+            return "Please provide an email.", 400
+        users = load_data()
+        if user_email == ADMIN_EMAIL or any(u["email"] == user_email for u in users):
+            return render_template("index.html")
+        return "Unauthorized access. Email not recognized in the system.", 401
 
-    # Default login page view
     return f"""
     <!doctype html>
     <title>Admin Chatbot Login</title>
     <style>
-        body {{ font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f4f4f4; }}
-        .login-box {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); text-align: center; }}
-        input[type=email] {{ padding: 10px; margin: 10px 0; border: 1px solid #ccc; border-radius: 4px; width: 250px; }}
-        input[type=submit] {{ background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }}
-        p {{ margin-bottom: 20px; color: #555; }}
+        body {{ font-family: sans-serif; display:flex; align-items:center; justify-content:center; height:100vh; background:#f4f4f4; }}
+        .box {{ background:white; padding:30px; border-radius:8px; box-shadow:0 4px 12px rgba(0,0,0,0.1); text-align:center; }}
+        input[type=email]{{padding:8px 10px; width:260px;}}
+        input[type=submit]{{padding:8px 12px; background:#007bff;color:white;border:none;border-radius:4px;}}
     </style>
-    <div class="login-box">
+    <div class="box">
         <h2>Admin Chatbot Login</h2>
-        <p>Use the admin email (**{ADMIN_EMAIL}**) to access the system.</p>
+        <p>Use admin email <strong>{ADMIN_EMAIL}</strong> or any email present in the system.</p>
         <form method="post">
-            <input type="email" name="email" placeholder="Enter your email" required value="{ADMIN_EMAIL}">
-            <input type="submit" value="Log In">
+            <input type="email" name="email" placeholder="Enter your email" required />
+            <br/><br/>
+            <input type="submit" value="Log In" />
         </form>
     </div>
     """
 
-@app.route('/chat', methods=['POST'])
+
+@app.route("/chat", methods=["POST"])
 def chat():
-    """Processes user commands and returns the chatbot's response."""
-    user_command = request.json.get('command', '').strip()
-    
-    if not user_command:
+    payload = request.get_json(force=True, silent=True) or {}
+    cmd = (payload.get("command") or "").strip()
+    if not cmd:
         return jsonify({"response": "Please enter a command."})
 
-    # 1. Intent Classification
-    intent = chatbot_model.classify_intent(user_command)
-    
-    # 2. Command Execution based on Intent
-    response = ""
-    if intent == 'add_user':
-        response = handle_add_user(user_command)
-    elif intent == 'delete_user':
-        response = handle_delete_user(user_command)
-    elif intent == 'update_user':
-        response = handle_update_user(user_command)
+    intent = classify_intent(cmd)
+    if intent == "add_user":
+        res = handle_add_user(cmd)
+    elif intent == "delete_user":
+        res = handle_delete_user(cmd)
+    elif intent == "update_user":
+        res = handle_update_user(cmd)
     else:
-        response = "I'm sorry, I don't understand that command. Please try 'add', 'remove', or 'update'."
+        res = "I'm sorry, I don't understand that command. Try: add, remove, or update."
 
-    # 3. Return a JSON response
-    return jsonify({"response": response})
+    return jsonify({"response": res})
 
-@app.route('/users', methods=['GET'])
+
+@app.route("/users", methods=["GET"])
 def get_users():
-    """Allows the admin to view the current user data."""
     return jsonify(load_data())
 
-if __name__ == '__main__':
-    # Initialize the data file if it doesn't exist
-    load_data()
-    # Run the application
-    app.run(debug=True)
+
+if __name__ == "__main__":
+    load_data()  # ensure file exists
+    app.run(debug=True, host="0.0.0.0", port=5000)
+
